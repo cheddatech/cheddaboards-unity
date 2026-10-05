@@ -4,6 +4,17 @@ All notable changes to the CheddaBoards Unity SDK are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1]
+
+Shared-device fix, matching the Godot SDK v2.3.1. No API changes.
+
+### Fixed
+- **Switching player with `SetPlayerId()` kept the previous player's state.** On a shared device (local roster, one ID per person) the backend-existence flag, cached profile, nickname, pending rename and play session all carried over to the next ID, so `ChangeNickname()` for a brand-new person was sent to the server for a player that didn't exist and the name was lost. `SetPlayerId()` now resets all per-player state when the ID changes; `Logout()` resets the same set.
+- **A per-player response still in flight when the player ID changed was applied to the new player.** Requests now carry a player generation; profile, rename, rank, session, submit and achievement responses (and queued requests) from a previous generation are dropped and logged `it was for the previous player`. Board reads and device-code calls are unaffected.
+
+### Changed
+- Switching person is `SetPlayerId()` → `LoginAnonymous()` → `GetPlayerProfile()`; calling `Logout()` first is no longer required. Guide: [Player names → Shared devices](https://docs.cheddaboards.com/concepts/player-names#shared-devices-several-players-one-install).
+
 ## [2.3.0]
 
 Minor bump: adds public API and changes two behaviours in the device-code flow. Matches the Godot SDK v2.3.0 release, and also picks up four account-flow fixes from Godot v2.2.4 that never reached the Unity SDK. Existing games keep working unchanged; login screens that show a device code should read the new section below.

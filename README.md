@@ -11,7 +11,7 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 [![Website](https://img.shields.io/badge/website-cheddaboards.com-blue)](https://cheddaboards.com)
 [![Docs](https://img.shields.io/badge/docs-docs.cheddaboards.com-blue)](https://docs.cheddaboards.com)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.3.0-green)]()
+[![Version](https://img.shields.io/badge/version-2.3.1-green)]()
 [![API uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fapi%2Fuptime.json&label=API%20uptime)](https://status.cheddatech.com)
 [![Leaderboards uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fleaderboards-on-chain%2Fuptime.json&label=leaderboards%20uptime)](https://status.cheddatech.com)
 
@@ -19,6 +19,7 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 
 ## What's new
 
+- **2.3.1** — Shared-device fix: switching player with SetPlayerId() now resets the previous player's state and drops their in-flight responses.
 - **2.3.0** — Device-code sign-in now survives an app restart or WebGL reload: the pending code is saved and polling resumes on the same code, so a player who comes back to a reloaded game is still signed in once they approve. `LoginWithDeviceCode()` reuses a pending code instead of minting a new one (pass `true` to force a fresh one); new `HasPendingDeviceCode()`, `GetDeviceVerificationUrl()` and `GetDeviceCodeSecondsRemaining()` for login screens. Also fixed: `GetGameStats()` (was hitting a route that doesn't exist), direct board reads no longer retry a 404 via the proxy, `GetAuthType()` reports the real provider after linking (Apple sign-ins were labelled google), linked accounts are created with the player's chosen nickname, and `OnAccountUpgradeFailed` actually fires. See [CHANGELOG.md](CHANGELOG.md).
 - **2.2.7** — Three fixes on the anonymous-player paths: submits no longer silently overwrite a player's saved nickname with a generated one; batch achievement sync reports the real synced ids instead of a false "0 synced"; and `GetAchievements()` works again (it now reads from the profile — the standalone route it called never existed). Until a new player's profile loads, `GetNickname()` returns "", so show "Guest"; the server assigns a name (e.g. `Player_1248`) on their first submit.
 - **2.2.6** — Board reads now come **straight from the CheddaBoards canister** for faster loads, with automatic proxy fallback (see 2.2.5). Fixed the `GetAlltimeLeaderboard()` / `GetWeeklyLeaderboard()` helpers, which queried the wrong board IDs. `GetLeaderboard()` default limit is now 100.

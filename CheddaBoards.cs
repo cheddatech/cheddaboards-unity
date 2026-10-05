@@ -1,4 +1,4 @@
-// CheddaBoards.cs v2.3.0
+// CheddaBoards.cs v2.3.1
 // CheddaBoards integration for Unity
 // https://github.com/cheddatech/CheddaBoards-Unity
 // https://cheddaboards.com
@@ -9,6 +9,20 @@
 //   Player authenticates on their phone at cheddaboards.com/link
 // - Score submissions, play sessions, achievements: all via HTTP API
 //
+// v2.3.1:
+//   - Fixed: switching player with SetPlayerId() (shared devices, local
+//     rosters) kept the previous player's state. _playerExistsOnBackend
+//     stayed true, so ChangeNickname() for a brand-new ID took the server
+//     path (PUT for a player that doesn't exist) instead of holding the name
+//     for the first submit, and the profile cache / pending rename / play
+//     session carried over. SetPlayerId() now resets all per-player state
+//     when the ID actually changes, and Logout() resets the existence /
+//     pending-rename flags too. Switch = SetPlayerId() + LoginAnonymous()
+//     + GetPlayerProfile(); Logout() first is no longer required.
+//   - Fixed: a per-player response (profile, rename, rank, session, submit)
+//     still in flight when the player ID changed was applied to the NEW
+//     player. Requests now carry a player generation; responses and queued
+//     requests from a previous generation are dropped and logged.
 // v2.3.0 (minor bump: adds public API and changes two behaviours, see below):
 //   - Device code linking survives an app restart / page reload. On phones
 //     and WebGL home-screen apps, tapping the link URL can reload the game
@@ -181,7 +195,7 @@ namespace CheddaTech
     public class CheddaBoards : MonoBehaviour
     {
         /// <summary>SDK version. Keep in sync with the header changelog.</summary>
-        public const string VERSION = "2.3.0";
+        public const string VERSION = "2.3.1";
 
         // ============================================================
         // SINGLETON
@@ -345,6 +359,14 @@ namespace CheddaTech
         //   fallback when a 2xx/ok response doesn't echo the nickname back
         //   (the old handler silently did NOTHING in that case).
         private bool _playerExistsOnBackend = false;
+        // Bumped whenever the active player changes. Per-player requests record the
+        // generation they were sent under; a response (or queued request) from an
+        // older generation is dropped, so a profile fetched for the previous person
+        // can't be stamped onto the next one mid-switch.
+        private int _playerGen = 0;
+        private static readonly HashSet<string> PER_PLAYER_TYPES = new HashSet<string> {
+            "player_profile", "change_nickname", "change_nickname_anonymous", "player_rank", "scoreboard_rank",
+            "start_play_session", "end_play_session", "submit_score", "submit_score_to_board", "unlock_achievement" };
         private string _pendingServerNickname = "";
         private int _pendingRenameAttempts = 0;
         private string _requestedNickname = "";
@@ -442,6 +464,7 @@ namespace CheddaTech
             public Dictionary<string, object> meta;
             public bool wentDirect = false;
             public bool directAttempted = false;
+            public int gen;
         }
 
         // ============================================================
@@ -543,7 +566,8 @@ namespace CheddaTech
                 method = method,
                 body = body ?? new Dictionary<string, object>(),
                 requestType = requestType,
-                meta = meta ?? new Dictionary<string, object>()
+                meta = meta ?? new Dictionary<string, object>(),
+                gen = _playerGen
             };
 
             if (_httpBusy)
@@ -638,6 +662,20 @@ namespace CheddaTech
             }
 
             yield return request.SendWebRequest();
+
+            // The active player changed while this request was in flight: its result
+            // belongs to the previous person. Drop it rather than apply it to the new one.
+            if (IsStaleForPlayer(requestData))
+            {
+                Log($"Ignoring {_currentEndpoint} response: it was for the previous player");
+                request.Dispose();
+                _isRefreshingProfile = false;
+                _isSubmittingScore = false;
+                _currentMeta = new Dictionary<string, object>();
+                _httpBusy = false;
+                ProcessNextRequest();
+                yield break;
+            }
 
             if (request.result == UnityWebRequest.Result.ConnectionError ||
                 request.result == UnityWebRequest.Result.ProtocolError)
@@ -1360,9 +1398,17 @@ namespace CheddaTech
             if (_requestQueue.Count == 0) return;
 
             var next = _requestQueue.Dequeue();
+            if (IsStaleForPlayer(next))
+            {
+                Log($"Dropping queued {next.requestType}: it was for the previous player");
+                ProcessNextRequest();
+                return;
+            }
             Log($"Processing queued request: {next.requestType}");
             ExecuteHttpRequest(next);
         }
+
+        private bool IsStaleForPlayer(RequestData r) => PER_PLAYER_TYPES.Contains(r.requestType) && r.gen != _playerGen;
 
         // ============================================================
         // PROFILE MANAGEMENT
@@ -1590,8 +1636,31 @@ namespace CheddaTech
 
         public void SetPlayerId(string playerId)
         {
-            _playerId = SanitizePlayerId(playerId);
+            string newId = SanitizePlayerId(playerId);
+            if (newId != _playerId)
+            {
+                // A different player: drop everything that belonged to the previous
+                // one, otherwise their cached profile/name leaks into the next person
+                // and ChangeNickname() for a brand-new ID is sent to the server.
+                ResetPlayerState();
+            }
+            _playerId = newId;
             Log($"Player ID set: {_playerId}");
+        }
+
+        /// <summary>Per-player state. Called when the active player ID changes and on logout.</summary>
+        private void ResetPlayerState()
+        {
+            _playerGen++;
+            _cachedProfile.Clear();
+            _nickname = "";
+            _nicknameJustChanged = false;
+            _playerExistsOnBackend = false;
+            _pendingServerNickname = "";
+            _pendingRenameAttempts = 0;
+            _requestedNickname = "";
+            _playSessionToken = "";
+            _lastProfileRefresh = 0f;
         }
 
         public string GetPlayerId()
@@ -1869,11 +1938,9 @@ namespace CheddaTech
 
         public void Logout()
         {
-            _cachedProfile.Clear();
+            ResetPlayerState();
             _authType = "";
-            _nickname = "";
             _sessionToken = "";
-            _playSessionToken = "";
             ClearSavedSession();
             CancelDeviceCode();
             OnLogoutSuccess?.Invoke();
