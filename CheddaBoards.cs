@@ -1,4 +1,4 @@
-// CheddaBoards.cs v2.2.7
+// CheddaBoards.cs v2.3.0
 // CheddaBoards integration for Unity
 // https://github.com/cheddatech/CheddaBoards-Unity
 // https://cheddaboards.com
@@ -9,6 +9,56 @@
 //   Player authenticates on their phone at cheddaboards.com/link
 // - Score submissions, play sessions, achievements: all via HTTP API
 //
+// v2.3.0 (minor bump: adds public API and changes two behaviours, see below):
+//   - Device code linking survives an app restart / page reload. On phones
+//     and WebGL home-screen apps, tapping the link URL can reload the game
+//     when the player comes back, which wiped the pending code from memory.
+//     The game's login screen then called LoginWithDeviceCode() again,
+//     minted a fresh code, and the player looped forever: each approval
+//     landed on a code the SDK had already forgotten. The pending code
+//     (device_code, user_code, link URL, QR, expiry) is now saved to
+//     PlayerPrefs when it arrives. On startup, if an unexpired code is
+//     saved and there is no saved session, polling resumes on the SAME
+//     code, and a subsequent LoginWithDeviceCode() call re-emits
+//     OnDeviceCodeReceived with the saved code instead of requesting a
+//     new one, so the UI shows the code the player already approved.
+//     The saved code is cleared on approval, expiry, invalid-code,
+//     CancelDeviceCode() and Logout(). Pass LoginWithDeviceCode(true) to
+//     force a brand-new code. The restore runs in Awake, which can be
+//     before a runtime SetGameId(); the code is held and polling starts
+//     (or the code is discarded if it was for another game) when
+//     SetGameId() is called.
+//   - New: HasPendingDeviceCode() reports whether an unexpired code is
+//     waiting (restored or in progress) so login screens can skip straight
+//     to "waiting for approval" after a reload; GetDeviceVerificationUrl()
+//     and GetDeviceCodeSecondsRemaining() let a popup re-show a restored
+//     code with its real remaining time.
+//   - Fixed: a direct canister read that returned a 4xx (e.g. 404 for a
+//     board that doesn't exist) was retried via the proxy as if it were a
+//     network failure, costing an extra proxy request for the same 404.
+//     Only transport failures and 5xx fall back now, as documented in 2.2.5.
+//   - Fixed: GetGameStats() requested /game/stats, which doesn't exist
+//     (OnRequestFailed on every call). Now fetches /game like GetGameInfo().
+//   - Docs: CancelDeviceCode() is for an explicit "cancel", not for
+//     closing the code popup. Closing the popup should just hide it and
+//     leave polling running, otherwise a player who dismisses the QR
+//     before their phone finishes ends up approved on the link page but
+//     still logged out in the game.
+//   - Ported from Godot 2.2.4 (never landed in the Unity SDK):
+//     * Linked accounts report their real provider (data.provider from
+//       the proxy) instead of always "google", so Apple sign-ins are no
+//       longer mislabelled. Older proxies that omit it still get "google".
+//     * Device code requests seed the player's current in-game nickname,
+//       so accounts CREATED via linking are born with the name the player
+//       chose instead of "Player_N". Existing accounts are untouched (the
+//       canister ignores the nickname for known users).
+//     * Fresh-account nickname preservation: when linking creates a new
+//       account (isNewUser) for a previously anonymous player with a
+//       chosen name, that name is restored after migration instead of
+//       being overwritten by the server-generated one. Merges into
+//       existing accounts keep the account's own nickname.
+//     * OnAccountUpgradeFailed now actually fires on migration failures
+//       (it was declared but never invoked).
 // v2.2.7:
 //   - Submits no longer rename the player. All three submit paths
 //     (SubmitScore, SubmitScoreWithAchievements, SubmitScoreToBoard)
@@ -131,7 +181,7 @@ namespace CheddaTech
     public class CheddaBoards : MonoBehaviour
     {
         /// <summary>SDK version. Keep in sync with the header changelog.</summary>
-        public const string VERSION = "2.2.7";
+        public const string VERSION = "2.3.0";
 
         // ============================================================
         // SINGLETON
@@ -172,7 +222,7 @@ namespace CheddaTech
         //        cb.OnDeviceCodeReceived += (code, url, qrDataUrl) =>
         //            codeLabel.text = $"Go to {url}\nEnter code: {code}";
         //        cb.OnDeviceCodeApproved += (nick) => Debug.Log("Welcome " + nick);
-        //        cb.LoginWithDeviceCode();
+        //        cb.LoginWithDeviceCode(); // reuses a pending code after a reload
         //    }
         //
         // Score submission:
@@ -327,6 +377,20 @@ namespace CheddaTech
         private bool _isPollingDeviceCode = false;
         private bool _deviceCodePollInFlight = false;
         private bool _deviceCodeApprovedFlag = false;
+        // Link URL + QR of the current code, kept so a restored code can be
+        // re-emitted to the UI after a reload without a new /auth/device/code call.
+        private string _deviceVerificationUrl = "";
+        private string _deviceQrDataUrl = "";
+        // Game the restored pending code was minted for. Awake runs before a
+        // runtime SetGameId(), so the game-id check is deferred to SetGameId.
+        private string _pendingLinkGameId = "";
+        // Fresh-account nickname preservation: when device-code linking CREATES a
+        // new account (isNewUser) while the player was anonymous, the account is
+        // born with a server-generated name ("Player_2") and migration then stamps
+        // it over the name the player actually chose. This holds the anon nickname
+        // so it can be restored right after OnAccountUpgraded. Empty = nothing to
+        // restore.
+        private string _pendingNicknameRestore = "";
 
         // ============================================================
         // REQUEST QUEUE
@@ -356,6 +420,14 @@ namespace CheddaTech
         private const string SESSION_NICKNAME_PREF_KEY = "cheddaboards_session_nickname";
         private const string SESSION_AUTH_TYPE_PREF_KEY = "cheddaboards_session_auth_type";
         private const string SESSION_SAVED_AT_PREF_KEY = "cheddaboards_session_saved_at";
+        // Pending device code (v2.3.0) - survives an app restart / page reload mid-link
+        private const string PENDING_LINK_CODE_KEY = "cheddaboards_pending_device_code";
+        private const string PENDING_LINK_USER_CODE_KEY = "cheddaboards_pending_user_code";
+        private const string PENDING_LINK_URL_KEY = "cheddaboards_pending_link_url";
+        private const string PENDING_LINK_QR_KEY = "cheddaboards_pending_link_qr";
+        private const string PENDING_LINK_EXPIRES_KEY = "cheddaboards_pending_link_expires";
+        private const string PENDING_LINK_INTERVAL_KEY = "cheddaboards_pending_link_interval";
+        private const string PENDING_LINK_GAME_KEY = "cheddaboards_pending_link_game";
 
         // ============================================================
         // INTERNAL TYPES
@@ -388,6 +460,11 @@ namespace CheddaTech
 
             Log($"Initializing CheddaBoards v{VERSION} (HTTP API Mode)...");
             LoadSavedSession();
+            // Resume an interrupted device code link (reload mid-link). Runs
+            // synchronously so a login screen that calls LoginWithDeviceCode()
+            // on OnSdkReady already sees the saved code. The poll loop's first
+            // tick is one interval away, so scenes have time to subscribe.
+            RestorePendingLink();
             _initComplete = true;
             StartCoroutine(EmitSdkReadyDeferred());
         }
@@ -565,9 +642,14 @@ namespace CheddaTech
             if (request.result == UnityWebRequest.Result.ConnectionError ||
                 request.result == UnityWebRequest.Result.ProtocolError)
             {
-                // A direct canister read that fails at the network level falls
-                // back to the proxy with the identical request.
-                if (requestData.wentDirect)
+                // A direct canister read that fails at the network level (or
+                // with a gateway 5xx) falls back to the proxy with the identical
+                // request. A 4xx from the canister is a real answer (e.g. 404
+                // board not found) and is NOT retried - UnityWebRequest reports
+                // every 4xx as ProtocolError, so check the status code too.
+                if (requestData.wentDirect &&
+                    (request.result == UnityWebRequest.Result.ConnectionError ||
+                     request.responseCode >= 500 || request.responseCode == 0))
                 {
                     request.Dispose();
                     RetryViaProxy(requestData, "network");
@@ -661,6 +743,8 @@ namespace CheddaTech
                 if (_currentEndpoint == "migrate_account")
                 {
                     Log($"Migration note: {errorMsg} (non-fatal, continuing)");
+                    _pendingNicknameRestore = "";
+                    OnAccountUpgradeFailed?.Invoke(errorMsg);
                     _currentMeta = new Dictionary<string, object>();
                     _httpBusy = false;
                     ProcessNextRequest();
@@ -1114,6 +1198,16 @@ namespace CheddaTech
                         { "migratedGames", migratedGames },
                         { "migratedScoreboards", migratedSb }
                     });
+                    // Fresh-account case: put the player's chosen anon name back on the
+                    // new account (server validates; suffixes on collision). No-op for
+                    // merges into existing accounts (_pendingNicknameRestore empty).
+                    if (!string.IsNullOrEmpty(_pendingNicknameRestore))
+                    {
+                        string restoreNick = _pendingNicknameRestore;
+                        _pendingNicknameRestore = "";
+                        Log($"Restoring player-chosen nickname on new account: {restoreNick}");
+                        ChangeNickname(restoreNick);
+                    }
                     break;
                 }
 
@@ -1131,9 +1225,13 @@ namespace CheddaTech
                     _deviceUserCode = uc;
                     _deviceCodePollInterval = interval;
                     _deviceCodeExpiresAt = GetUnixTime() + expiresIn;
+                    _deviceVerificationUrl = !string.IsNullOrEmpty(urlComplete) ? urlComplete : urlVal;
+                    _deviceQrDataUrl = qrDataUrl;
+                    _pendingLinkGameId = gameId;
+                    SavePendingLink();
 
                     Log($"Device code received: {RedactCode(uc)} (expires in {expiresIn}s)");
-                    OnDeviceCodeReceived?.Invoke(uc, !string.IsNullOrEmpty(urlComplete) ? urlComplete : urlVal, qrDataUrl);
+                    OnDeviceCodeReceived?.Invoke(uc, _deviceVerificationUrl, _deviceQrDataUrl);
                     StartDeviceCodePolling();
                     break;
                 }
@@ -1236,6 +1334,11 @@ namespace CheddaTech
                     break;
                 case "end_play_session":
                     Log($"End play session error (ignored): {error}");
+                    break;
+                case "migrate_account":
+                    Log($"Migration failed: {error}");
+                    _pendingNicknameRestore = "";
+                    OnAccountUpgradeFailed?.Invoke(error);
                     break;
                 case "device_code_request":
                     Log($"Device code request failed: {error}");
@@ -1475,6 +1578,7 @@ namespace CheddaTech
         {
             gameId = id;
             Log($"Game ID set: {id}");
+            ReconcilePendingLinkWithGameId();
         }
 
         public void SetSessionToken(string token)
@@ -1568,6 +1672,113 @@ namespace CheddaTech
             PlayerPrefs.DeleteKey(SESSION_SAVED_AT_PREF_KEY);
             PlayerPrefs.Save();
             Log("Saved session cleared");
+        }
+
+        // ============================================================
+        // PENDING DEVICE CODE PERSISTENCE (v2.3.0)
+        // ============================================================
+        // On phones / WebGL home-screen apps the game can be reloaded while
+        // the player is off approving the code in their browser. Without
+        // this the code lived only in memory, the login screen minted a new
+        // one on reload, and every approval hit a code the SDK had already
+        // dropped.
+
+        private void SavePendingLink()
+        {
+            if (string.IsNullOrEmpty(_deviceCode))
+                return;
+            PlayerPrefs.SetString(PENDING_LINK_CODE_KEY, _deviceCode);
+            PlayerPrefs.SetString(PENDING_LINK_USER_CODE_KEY, _deviceUserCode);
+            PlayerPrefs.SetString(PENDING_LINK_URL_KEY, _deviceVerificationUrl);
+            PlayerPrefs.SetString(PENDING_LINK_QR_KEY, _deviceQrDataUrl);
+            // Stored as a string: PlayerPrefs.SetFloat is single precision and
+            // loses whole seconds at unix-time magnitudes.
+            PlayerPrefs.SetString(PENDING_LINK_EXPIRES_KEY, _deviceCodeExpiresAt.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+            PlayerPrefs.SetFloat(PENDING_LINK_INTERVAL_KEY, _deviceCodePollInterval);
+            PlayerPrefs.SetString(PENDING_LINK_GAME_KEY, gameId ?? "");
+            PlayerPrefs.Save();
+            Log($"Pending device code saved ({RedactCode(_deviceUserCode)})");
+        }
+
+        private void ClearPendingLink()
+        {
+            if (!PlayerPrefs.HasKey(PENDING_LINK_CODE_KEY))
+                return;
+            PlayerPrefs.DeleteKey(PENDING_LINK_CODE_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_USER_CODE_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_URL_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_QR_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_EXPIRES_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_INTERVAL_KEY);
+            PlayerPrefs.DeleteKey(PENDING_LINK_GAME_KEY);
+            PlayerPrefs.Save();
+            Log("Pending device code cleared");
+        }
+
+        private void RestorePendingLink()
+        {
+            if (!PlayerPrefs.HasKey(PENDING_LINK_CODE_KEY))
+                return;
+            // Already signed in (session restored) - a leftover code is stale.
+            if (!string.IsNullOrEmpty(_sessionToken))
+            {
+                ClearPendingLink();
+                return;
+            }
+            string dc = PlayerPrefs.GetString(PENDING_LINK_CODE_KEY, "");
+            double expiresAt = 0;
+            double.TryParse(PlayerPrefs.GetString(PENDING_LINK_EXPIRES_KEY, "0"),
+                System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out expiresAt);
+            string savedGame = PlayerPrefs.GetString(PENDING_LINK_GAME_KEY, "");
+            if (string.IsNullOrEmpty(dc) || GetUnixTime() >= expiresAt)
+            {
+                Log("Saved device code has expired - discarding");
+                ClearPendingLink();
+                return;
+            }
+            _pendingLinkGameId = savedGame;
+            _deviceCode = dc;
+            _deviceUserCode = PlayerPrefs.GetString(PENDING_LINK_USER_CODE_KEY, "");
+            _deviceVerificationUrl = PlayerPrefs.GetString(PENDING_LINK_URL_KEY, "");
+            _deviceQrDataUrl = PlayerPrefs.GetString(PENDING_LINK_QR_KEY, "");
+            _deviceCodeExpiresAt = expiresAt;
+            _deviceCodePollInterval = Mathf.Max(1.0f, PlayerPrefs.GetFloat(PENDING_LINK_INTERVAL_KEY, 5.0f));
+            // Awake can run before the game sets its ID at runtime (the
+            // CheddaBoards.Instance + SetGameId() pattern), so only start
+            // polling now if the ID already matches; otherwise SetGameId()
+            // resumes or discards the code once it knows the real game.
+            if (string.IsNullOrEmpty(savedGame) || savedGame == gameId)
+            {
+                Log($"Resuming device code link after reload: {RedactCode(_deviceUserCode)} ({(int)(expiresAt - GetUnixTime())}s left)");
+                StartDeviceCodePolling();
+            }
+            else
+            {
+                Log($"Pending device code restored for game '{savedGame}' - waiting for SetGameId() before polling");
+            }
+        }
+
+        // Called from SetGameId(): resume or discard a code restored before
+        // the game ID was known.
+        private void ReconcilePendingLinkWithGameId()
+        {
+            if (string.IsNullOrEmpty(_deviceCode) || _isPollingDeviceCode)
+                return;
+            if (!HasPendingDeviceCode())
+            {
+                ClearDeviceCodeState();
+                return;
+            }
+            if (string.IsNullOrEmpty(_pendingLinkGameId) || _pendingLinkGameId == gameId)
+            {
+                Log($"Resuming device code link after reload: {RedactCode(_deviceUserCode)} ({GetDeviceCodeSecondsRemaining()}s left)");
+                StartDeviceCodePolling();
+            }
+            else
+            {
+                Log("Saved device code belongs to another game - discarding");
+                ClearDeviceCodeState();
+            }
         }
 
         private void ExpireSession()
@@ -1664,6 +1875,7 @@ namespace CheddaTech
             _sessionToken = "";
             _playSessionToken = "";
             ClearSavedSession();
+            CancelDeviceCode();
             OnLogoutSuccess?.Invoke();
             Log("Logged out");
         }
@@ -1764,8 +1976,15 @@ namespace CheddaTech
 
         /// <summary>Start device code login flow.
         /// Emits OnDeviceCodeReceived with the code to show the player.
-        /// Automatically polls for approval and emits OnDeviceCodeApproved on success.</summary>
-        public void LoginWithDeviceCode()
+        /// Automatically polls for approval and emits OnDeviceCodeApproved on success.
+        ///
+        /// If an unexpired code is already pending (in progress, or restored from
+        /// PlayerPrefs after an app restart / page reload), that code is
+        /// re-emitted via OnDeviceCodeReceived and polling continues on it - no
+        /// new code is minted, so an approval the player already gave still
+        /// lands. Pass forceNew = true to discard the pending code and request a
+        /// fresh one.</summary>
+        public void LoginWithDeviceCode(bool forceNew = false)
         {
             if (!_initComplete)
             {
@@ -1779,24 +1998,93 @@ namespace CheddaTech
                 return;
             }
 
+            if (!forceNew && HasPendingDeviceCode())
+            {
+                Log($"Reusing pending device code: {RedactCode(_deviceUserCode)}");
+                if (!_isPollingDeviceCode)
+                    StartDeviceCodePolling();
+                OnDeviceCodeReceived?.Invoke(_deviceUserCode, _deviceVerificationUrl, _deviceQrDataUrl);
+                // Someone may have approved it while we were reloading - check now.
+                if (!_deviceCodePollInFlight)
+                {
+                    _deviceCodePollInFlight = true;
+                    StartCoroutine(PollDeviceCodeToken());
+                }
+                return;
+            }
+
             StopDeviceCodePolling();
+            ClearDeviceCodeState();
 
             Log($"Requesting device code for game: {gameId}");
             var body = new Dictionary<string, object> { { "gameId", gameId } };
+            // Seed the player's current nickname so that if this link CREATES a new
+            // account, it's born with the name they chose in-game (server suffixes
+            // on collision). Existing accounts are unaffected - the canister ignores
+            // the nickname for known users. Fixes new accounts landing as "Player_N".
+            if (!string.IsNullOrEmpty(_nickname))
+                body["nickname"] = _nickname;
             MakeHttpRequest("/auth/device/code", "POST", body, "device_code_request");
         }
 
-        /// <summary>Cancel an in-progress device code login.</summary>
+        /// <summary>Abandon an in-progress device code login. Stops polling, forgets
+        /// the code and deletes the saved pending code, so an approval the player
+        /// gives AFTER this call is never picked up (the link page will still say
+        /// "success" - it can't know the game gave up).
+        ///
+        /// Call this only when the player explicitly abandons the login ("Cancel",
+        /// "Use a different account"). Do NOT call it when they simply close the
+        /// code/QR popup: hide the popup and leave polling running, and
+        /// OnDeviceCodeApproved / OnLoginSuccess will still fire when their phone
+        /// finishes. Polling stops by itself on approval or expiry.</summary>
         public void CancelDeviceCode()
         {
+            bool hadCode = !string.IsNullOrEmpty(_deviceCode);
             StopDeviceCodePolling();
+            ClearDeviceCodeState();
+            if (hadCode)
+                Log("Device code login cancelled");
+        }
+
+        /// <summary>Check whether an unexpired device code is waiting for approval.
+        /// True both for a code requested this session and for one restored from
+        /// PlayerPrefs after a reload. Unlike IsDeviceCodePending() this does not
+        /// require polling to be active.</summary>
+        public bool HasPendingDeviceCode()
+        {
+            if (string.IsNullOrEmpty(_deviceCode))
+                return false;
+            return GetUnixTime() < _deviceCodeExpiresAt;
+        }
+
+        /// <summary>Drop all in-memory device code state and the saved pending code.</summary>
+        private void ClearDeviceCodeState()
+        {
             _deviceCode = "";
             _deviceUserCode = "";
-            Log("Device code login cancelled");
+            _deviceVerificationUrl = "";
+            _deviceQrDataUrl = "";
+            _deviceCodeExpiresAt = 0;
+            _pendingLinkGameId = "";
+            ClearPendingLink();
         }
 
         /// <summary>Get the current user code (for display purposes).</summary>
         public string GetDeviceUserCode() => _deviceUserCode;
+
+        /// <summary>Link URL for the current code (empty if none). Lets a popup
+        /// re-show a restored code without waiting for a new OnDeviceCodeReceived.</summary>
+        public string GetDeviceVerificationUrl() => _deviceVerificationUrl;
+
+        /// <summary>Seconds until the current device code expires (0 if none). A
+        /// code restored after a reload has LESS than the original 300s left, so
+        /// UIs should read this rather than assume a fresh 5 minutes.</summary>
+        public int GetDeviceCodeSecondsRemaining()
+        {
+            if (string.IsNullOrEmpty(_deviceCode))
+                return 0;
+            return Math.Max(0, (int)(_deviceCodeExpiresAt - GetUnixTime()));
+        }
 
         /// <summary>Check if a device code login is in progress.</summary>
         public bool IsDeviceCodePending() => _isPollingDeviceCode && !string.IsNullOrEmpty(_deviceCode);
@@ -1843,8 +2131,7 @@ namespace CheddaTech
                 {
                     Log($"Device code expired: {RedactCode(_deviceUserCode)}");
                     StopDeviceCodePolling();
-                    _deviceCode = "";
-                    _deviceUserCode = "";
+                    ClearDeviceCodeState();
                     OnDeviceCodeExpired?.Invoke();
                     yield break;
                 }
@@ -1908,8 +2195,7 @@ namespace CheddaTech
             {
                 Log("Device code expired (server confirmed)");
                 StopDeviceCodePolling();
-                _deviceCode = "";
-                _deviceUserCode = "";
+                ClearDeviceCodeState();
                 OnDeviceCodeExpired?.Invoke();
                 yield break;
             }
@@ -1936,10 +2222,22 @@ namespace CheddaTech
                     string previousAnonymousId = _playerId;
                     bool wasAnonymous = _authType == "anonymous" && !string.IsNullOrEmpty(previousAnonymousId);
 
+                    // Fresh-account nickname preservation: if this link CREATED the account
+                    // (isNewUser) and the player was anonymous with a chosen name, restore
+                    // that name after migration instead of keeping the generated one.
+                    // Existing accounts keep their own nickname (merge case) - untouched.
+                    bool isNewUser = data.ContainsKey("isNewUser") && data["isNewUser"] is bool nu && nu;
+                    _pendingNicknameRestore = "";
+                    if (wasAnonymous && isNewUser && !string.IsNullOrEmpty(_nickname) && _nickname != nickname)
+                    {
+                        _pendingNicknameRestore = _nickname;
+                        Log($"New account created at link time - will restore anon nickname '{_nickname}' after migration");
+                    }
+
                     // Set session state
                     _sessionToken = sessionId;
                     _nickname = nickname;
-                    _authType = "google"; // Provider determined by what they chose on the page
+                    _authType = GetString(data, "provider", "google"); // Real provider from proxy; older proxies omit it
                     SaveSession();
 
                     // Clear stale anonymous play session
@@ -1965,9 +2263,8 @@ namespace CheddaTech
                         OnProfileLoaded?.Invoke(nickname, 0, 0, new List<object>(), 0);
                     }
 
-                    // Clear device code state
-                    _deviceCode = "";
-                    _deviceUserCode = "";
+                    // Clear device code state (memory + saved pending code)
+                    ClearDeviceCodeState();
 
                     // Emit both signals so existing login flows work
                     OnDeviceCodeApproved?.Invoke(nickname);
@@ -1991,8 +2288,7 @@ namespace CheddaTech
                 }
                 Log("Device code invalid or expired");
                 StopDeviceCodePolling();
-                _deviceCode = "";
-                _deviceUserCode = "";
+                ClearDeviceCodeState();
                 OnDeviceCodeError?.Invoke("Invalid or expired code");
                 yield break;
             }
@@ -2011,6 +2307,7 @@ namespace CheddaTech
             if (string.IsNullOrEmpty(anonymousDeviceId) || string.IsNullOrEmpty(_sessionToken))
             {
                 Log("Migration skipped: missing device ID or session token");
+                OnAccountUpgradeFailed?.Invoke("Missing device ID or session token");
                 return;
             }
 
@@ -2493,7 +2790,11 @@ namespace CheddaTech
         // ============================================================
 
         public void GetGameInfo() => MakeHttpRequest("/game", "GET", new Dictionary<string, object>(), "game_info");
-        public void GetGameStats() => MakeHttpRequest("/game/stats", "GET", new Dictionary<string, object>(), "game_stats");
+        /// <summary>Game totals (totalPlayers, totalPlays) are part of GET /game; there
+        /// is no separate stats route. Kept for compatibility - identical to
+        /// GetGameInfo(). (Before 2.3.0 this requested /game/stats, which doesn't
+        /// exist, and failed with OnRequestFailed every time.)</summary>
+        public void GetGameStats() => MakeHttpRequest("/game", "GET", new Dictionary<string, object>(), "game_stats");
         public void HealthCheck() => MakeHttpRequest("/health", "GET", new Dictionary<string, object>(), "health");
 
         // ============================================================

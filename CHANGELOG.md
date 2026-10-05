@@ -4,6 +4,28 @@ All notable changes to the CheddaBoards Unity SDK are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0]
+
+Minor bump: adds public API and changes two behaviours in the device-code flow. Matches the Godot SDK v2.3.0 release, and also picks up four account-flow fixes from Godot v2.2.4 that never reached the Unity SDK. Existing games keep working unchanged; login screens that show a device code should read the new section below.
+
+### Added
+- **Device-code linking survives an app restart / page reload.** On phones and WebGL home-screen apps, tapping the link URL can reload the game when the player comes back, which wiped the pending code from memory. The game's login screen then called `LoginWithDeviceCode()` again, minted a fresh code, and the player looped forever: each approval landed on a code the SDK had already forgotten. The pending code (device code, user code, link URL, QR, expiry, poll interval, game ID) is now saved to `PlayerPrefs` when it arrives. On startup, if an unexpired code is saved and there is no saved session, polling resumes on the **same** code. The saved code is cleared on approval, expiry, invalid-code, `CancelDeviceCode()` and `Logout()`.
+- **`LoginWithDeviceCode(bool forceNew = false)`.** If an unexpired code is already pending (in progress, or restored after a reload), the call re-emits `OnDeviceCodeReceived` with that code and keeps polling it instead of requesting a new one, so the UI shows the code the player already approved. Pass `true` to discard the pending code and mint a fresh one.
+- **`HasPendingDeviceCode()`** reports whether an unexpired code is waiting (restored or in progress), so a login screen can skip straight to "waiting for approval" after a reload. Unlike `IsDeviceCodePending()` it does not require polling to be active.
+- **`GetDeviceVerificationUrl()`** and **`GetDeviceCodeSecondsRemaining()`** let a popup re-show a restored code with its real remaining time. A restored code has *less* than the original 300 s left, so read this rather than assuming a fresh five minutes.
+
+### Fixed
+- **`GetGameStats()` requested `/game/stats`, which doesn't exist**, so it failed with `OnRequestFailed` every time. It now fetches `/game` like `GetGameInfo()`; the totals (`totalPlayers`, `totalPlays`) are part of that response.
+- **Direct canister reads no longer fall back to the proxy on a 4xx.** A `404` for a board that doesn't exist was retried via the proxy as if it were a network failure, costing an extra proxy request for the same answer. `UnityWebRequest` reports every 4xx as `ProtocolError`, so the fallback now checks the status code: only transport failures and 5xx fall back, as documented in 2.2.5.
+- **Linked accounts report their real provider.** `GetAuthType()` always returned `"google"` after device-code approval; it now reads the provider the proxy returns, so Apple sign-ins are no longer mislabelled. Older proxies that omit it still get `"google"`. *(From Godot 2.2.4.)*
+- **Device-code requests seed the player's current in-game nickname**, so accounts **created** via linking are born with the name the player chose instead of `Player_N`. Existing accounts are untouched: the canister ignores the nickname for known users. *(From Godot 2.2.4.)*
+- **Fresh-account nickname preservation.** When linking creates a new account (`isNewUser`) for a previously anonymous player with a chosen name, that name is restored after migration instead of being overwritten by the server-generated one. Merges into existing accounts keep the account's own nickname. *(From Godot 2.2.4.)*
+- **`OnAccountUpgradeFailed` now actually fires** on migration failures. It was declared but never invoked. *(From Godot 2.2.4.)*
+
+### Changed
+- **`CancelDeviceCode()` is for an explicit cancel, not for closing the code popup.** It stops polling, forgets the code and deletes the saved pending code, so an approval the player gives *after* the call is never picked up (the link page will still say "success"; it can't know the game gave up). Call it only when the player explicitly abandons the login ("Cancel", "Use a different account"). When they simply close the code/QR popup, hide the popup and leave polling running: `OnDeviceCodeApproved` / `OnLoginSuccess` still fire when their phone finishes, and polling stops by itself on approval or expiry.
+- The pending-code restore runs in `Awake`, which can be before a runtime `SetGameId()` (the `CheddaBoards.Instance` + `SetGameId()` pattern). The restored code is held, and polling starts (or the code is discarded if it was minted for another game) when `SetGameId()` is called. A component with its game ID set in the inspector resumes immediately.
+
 ## [2.2.7]
 
 Two fixes and one repaired method on the anonymous-player paths, matching the Godot SDK v2.2.7 release. No API changes — drop-in for existing games.

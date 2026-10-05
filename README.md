@@ -11,7 +11,7 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 [![Website](https://img.shields.io/badge/website-cheddaboards.com-blue)](https://cheddaboards.com)
 [![Docs](https://img.shields.io/badge/docs-docs.cheddaboards.com-blue)](https://docs.cheddaboards.com)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.2.7-green)]()
+[![Version](https://img.shields.io/badge/version-2.3.0-green)]()
 [![API uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fapi%2Fuptime.json&label=API%20uptime)](https://status.cheddatech.com)
 [![Leaderboards uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fleaderboards-on-chain%2Fuptime.json&label=leaderboards%20uptime)](https://status.cheddatech.com)
 
@@ -19,12 +19,13 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 
 ## What's new
 
+- **2.3.0** — Device-code sign-in now survives an app restart or WebGL reload: the pending code is saved and polling resumes on the same code, so a player who comes back to a reloaded game is still signed in once they approve. `LoginWithDeviceCode()` reuses a pending code instead of minting a new one (pass `true` to force a fresh one); new `HasPendingDeviceCode()`, `GetDeviceVerificationUrl()` and `GetDeviceCodeSecondsRemaining()` for login screens. Also fixed: `GetGameStats()` (was hitting a route that doesn't exist), direct board reads no longer retry a 404 via the proxy, `GetAuthType()` reports the real provider after linking (Apple sign-ins were labelled google), linked accounts are created with the player's chosen nickname, and `OnAccountUpgradeFailed` actually fires. See [CHANGELOG.md](CHANGELOG.md).
 - **2.2.7** — Three fixes on the anonymous-player paths: submits no longer silently overwrite a player's saved nickname with a generated one; batch achievement sync reports the real synced ids instead of a false "0 synced"; and `GetAchievements()` works again (it now reads from the profile — the standalone route it called never existed). Until a new player's profile loads, `GetNickname()` returns "", so show "Guest"; the server assigns a name (e.g. `Player_1248`) on their first submit.
 - **2.2.6** — Board reads now come **straight from the CheddaBoards canister** for faster loads, with automatic proxy fallback (see 2.2.5). Fixed the `GetAlltimeLeaderboard()` / `GetWeeklyLeaderboard()` helpers, which queried the wrong board IDs. `GetLeaderboard()` default limit is now 100.
 - **2.2.5** — Direct canister reads: `GetScoreboard()` and the Weekly / Daily / Alltime / Monthly helpers read directly from the Internet Computer, keyless and CORS-simple, falling back to the proxy automatically if the direct path can't get through. Same events, no code changes.
 - **2.2.3** — Sessions persist across restarts (device-code sign-in is now a one-time flow), plus a new `OnSessionExpired` event. Nickname validation matches the canonical rule (3–16 chars, letters/numbers/underscores).
 
-Full history is in the header comment of `CheddaBoards.cs`.
+Full history: [CHANGELOG.md](CHANGELOG.md) and the header comment of `CheddaBoards.cs`.
 
 ---
 
@@ -154,6 +155,10 @@ cb.OnDeviceCodeExpired += () => Debug.Log("Code expired, try again");
 cb.LoginWithDeviceCode();
 ```
 
+A pending code survives an app restart or page reload (it's saved to `PlayerPrefs` and polling resumes on the same code), and `LoginWithDeviceCode()` re-emits that code rather than minting a new one, so a login screen can just call it on startup. Use `HasPendingDeviceCode()` to skip straight to "waiting for approval", and `GetDeviceVerificationUrl()` / `GetDeviceCodeSecondsRemaining()` to redraw a restored code with its real time left. Pass `LoginWithDeviceCode(true)` to force a fresh code.
+
+> **Closing the popup is not cancelling.** If the player dismisses the code/QR popup, just hide it and leave polling running; `OnDeviceCodeApproved` / `OnLoginSuccess` still fire when their phone finishes. Only call `CancelDeviceCode()` on an explicit "Cancel" or "Use a different account", since an approval given after that call is never picked up.
+
 Full device-code flow, including QR rendering: [Device code login](https://docs.cheddaboards.com/concepts/device-code).
 
 ### Account Migration
@@ -166,6 +171,7 @@ cb.OnAccountUpgraded += (profile, migration) =>
     // profile: the merged account's profile; migration: migratedGames / migratedScoreboards counts
     Debug.Log($"Account upgraded! {migration["migratedScoreboards"]} boards merged.");
 };
+cb.OnAccountUpgradeFailed += (error) => Debug.Log($"Migration failed: {error}");
 
 cb.MigrateAnonymousToCurrent(anonymousDeviceId);
 ```
@@ -325,6 +331,7 @@ Caps, time validation, and the suspicion log: [Anti-cheat](https://docs.cheddabo
 | `OnDeviceCodeApproved` | `nickname` | Social login completed |
 | `OnDeviceCodeExpired` | — | Code timed out |
 | `OnAccountUpgraded` | `profile, migration` | Migration completed (`migration` carries `migratedGames` / `migratedScoreboards`) |
+| `OnAccountUpgradeFailed` | `error` | Anonymous-to-account migration failed (the login itself still succeeded) |
 | `OnProfileLoaded` | `nickname, score, streak, achievements, playCount` | Profile data received |
 | `OnNicknameChanged` | `nickname` | Nickname updated |
 | `OnArchivesListLoaded` | `scoreboardId, archives` | Archive list received |
@@ -344,6 +351,12 @@ cb.GetHighScore()        // cached high score
 cb.GetBestStreak()       // cached best streak
 cb.GetPlayCount()        // cached play count
 cb.GetPlayerId()         // persistent device ID
+cb.GetAuthType()         // "anonymous", "google", "apple", ...
+
+cb.HasPendingDeviceCode()            // an unexpired device code is waiting for approval
+cb.GetDeviceUserCode()               // the code to show the player
+cb.GetDeviceVerificationUrl()        // the link page URL for that code
+cb.GetDeviceCodeSecondsRemaining()   // real time left (less than 300 after a reload)
 ```
 
 ---
