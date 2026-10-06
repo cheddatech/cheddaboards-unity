@@ -17,8 +17,15 @@
 //     for the first submit, and the profile cache / pending rename / play
 //     session carried over. SetPlayerId() now resets all per-player state
 //     when the ID actually changes, and Logout() resets the existence /
-//     pending-rename flags too. Switch = SetPlayerId() + LoginAnonymous()
-//     + GetPlayerProfile(); Logout() first is no longer required.
+//     pending-rename flags too. Switch = Logout() + SetPlayerId() +
+//     LoginAnonymous() + GetPlayerProfile().
+//     Logout() is still part of the switch: SetPlayerId() resets
+//     per-player state but does NOT drop a signed-in session or a device
+//     code waiting for approval. If the previous person linked an account
+//     and you skip Logout(), the session token stays active and the next
+//     person's profile, scores and renames go to that account whatever
+//     player ID is set. With no session it is a harmless no-op (it fires
+//     OnLogoutSuccess, so ignore that event during a switch).
 //   - Fixed: a per-player response (profile, rename, rank, session, submit)
 //     still in flight when the player ID changed was applied to the NEW
 //     player. Requests now carry a player generation; responses and queued
