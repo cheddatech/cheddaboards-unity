@@ -1,4 +1,4 @@
-// CheddaBoards.cs v2.3.1
+// CheddaBoards.cs v2.5.0
 // CheddaBoards integration for Unity
 // https://github.com/cheddatech/CheddaBoards-Unity
 // https://cheddaboards.com
@@ -9,6 +9,41 @@
 //   Player authenticates on their phone at cheddaboards.com/link
 // - Score submissions, play sessions, achievements: all via HTTP API
 //
+// v2.5.0 (minor bump: adds public API and changes one behaviour, see 2.4.0
+//   below). Parity with the Godot 4 SDK v2.5.0, including its 2.4.0 changes,
+//   which never shipped as a separate Unity release.
+//   - International display names. A player can have a display name in any
+//     language (Japanese, Korean, Cyrillic, accented Latin...) alongside their
+//     nickname. The nickname is unchanged: unique, ASCII, 3-16. The display
+//     name is optional, one per account, not unique, and only works in games
+//     where the developer turned on "International names" in the dashboard
+//     (your fonts need those characters: add a TMP fallback font).
+//   - New SetDisplayName(name) / ClearDisplayName(), with
+//     OnDisplayNameChanged(displayName) ("" = cleared) and
+//     OnDisplayNameError(reason). A name set before the player's first score
+//     is held by the API and applied with that first score. The server
+//     normalises the name, so show the value from OnDisplayNameChanged.
+//   - GetDisplayName() returns the player's own display name ("" if none).
+//     Board entries carry an optional "displayName"; GetEntryName(entry)
+//     returns it when present and the nickname otherwise.
+//   - GetGameInfo() now fires OnGameInfoLoaded(info) and sets
+//     InternationalNames.
+// v2.4.0 changes (first released in Unity as part of 2.5.0):
+//   - The game ID is read from the API key (cb_<game-id>_...), so
+//     SetApiKey() alone is enough. SetGameId() is optional and still wins if
+//     you call it with a value; a mismatch with the key is logged.
+//     SetGameId("") means "no override" and falls back to the key. The old
+//     Inspector default ("cheddaclick-v2") counts as unset.
+//   - Logout(true) also throws away the saved device ID, so the next
+//     LoginAnonymous() is a brand-new guest (shared devices, testing
+//     link/merge). Plain Logout() is unchanged. New ResetDeviceId() does
+//     the device-ID part on its own.
+//   - Behaviour change: LoginAnonymous() while a linked session is active is
+//     now ignored (logged, and OnLoginSuccess fires with the linked
+//     nickname). Before, it flipped the SDK to "guest" (HasAccount() false)
+//     while every request still carried the account's session, so games
+//     calling it at startup showed a restored linked player as a guest. To
+//     really switch to a guest, call Logout() first.
 // v2.3.1:
 //   - Fixed: switching player with SetPlayerId() (shared devices, local
 //     rosters) kept the previous player's state. _playerExistsOnBackend
@@ -202,7 +237,7 @@ namespace CheddaTech
     public class CheddaBoards : MonoBehaviour
     {
         /// <summary>SDK version. Keep in sync with the header changelog.</summary>
-        public const string VERSION = "2.3.1";
+        public const string VERSION = "2.5.0";
 
         // ============================================================
         // SINGLETON
@@ -228,7 +263,7 @@ namespace CheddaTech
         // ============================================================
         // 1. Add CheddaBoards.Instance to your scene (auto-creates singleton)
         // 2. Set your API key: CheddaBoards.Instance.SetApiKey("cb_xxx");
-        // 3. Set your game ID: CheddaBoards.Instance.SetGameId("your-game");
+        //    (the game ID is read from the key; SetGameId("your-game") is optional)
         //
         // Anonymous login:
         //    void Start() {
@@ -272,6 +307,10 @@ namespace CheddaTech
         public event Action OnNoProfile;
         public event Action<string> OnNicknameChanged;
         public event Action<string> OnNicknameError;
+        /// <summary>v2.5.0: the player's display name was set or cleared ("" = cleared).
+        /// Show this value, not the one you sent: the server normalises it.</summary>
+        public event Action<string> OnDisplayNameChanged;
+        public event Action<string> OnDisplayNameError;
 
         // --- Scores & Leaderboards (Legacy) ---
         public event Action<int, int> OnScoreSubmitted;
@@ -299,6 +338,8 @@ namespace CheddaTech
 
         // --- HTTP API ---
         public event Action<string, string> OnRequestFailed;
+        /// <summary>v2.5.0: GET /game answered (also sets InternationalNames).</summary>
+        public event Action<Dictionary<string, object>> OnGameInfoLoaded;
 
         // --- Play Sessions (Time Validation) ---
         public event Action<string> OnPlaySessionStarted;
@@ -335,8 +376,16 @@ namespace CheddaTech
         /// <summary>Your API key (set via SetApiKey()).</summary>
         public string apiKey = "";
 
-        /// <summary>Your game ID (set via SetGameId()).</summary>
+        /// <summary>Your game ID. Read from the API key automatically; only call
+        /// SetGameId() if you need to override it.</summary>
         public string gameId = "cheddaclick-v2";
+        private bool _gameIdFromKey = false;   // gameId came from the key, not SetGameId()
+        // The Inspector default before 2.4.0. Treated as "not set" so the key's game wins.
+        private const string LEGACY_DEFAULT_GAME_ID = "cheddaclick-v2";
+
+        /// <summary>v2.5.0: true when this game has "International names" turned on in
+        /// the dashboard. Filled by GetGameInfo(); false until then.</summary>
+        public bool InternationalNames { get; private set; } = false;
 
         private string _playerId = "";
         private string _sessionToken = "";       // For OAuth session-based auth
@@ -351,6 +400,8 @@ namespace CheddaTech
         private Dictionary<string, object> _cachedProfile = new Dictionary<string, object>();
         private bool _nicknameJustChanged = false;
         private string _nickname = "";
+        private string _displayName = "";            // v2.5.0, from the profile / last set
+        private string _requestedDisplayName = "";   // sent in the last display name PUT
 
         // Rename correctness state (v2.2.8):
         // _playerExistsOnBackend - true once ANY server op confirms the player
@@ -373,7 +424,8 @@ namespace CheddaTech
         private int _playerGen = 0;
         private static readonly HashSet<string> PER_PLAYER_TYPES = new HashSet<string> {
             "player_profile", "change_nickname", "change_nickname_anonymous", "player_rank", "scoreboard_rank",
-            "start_play_session", "end_play_session", "submit_score", "submit_score_to_board", "unlock_achievement" };
+            "start_play_session", "end_play_session", "submit_score", "submit_score_to_board", "unlock_achievement",
+            "change_display_name" };
         private string _pendingServerNickname = "";
         private int _pendingRenameAttempts = 0;
         private string _requestedNickname = "";
@@ -489,6 +541,7 @@ namespace CheddaTech
             DontDestroyOnLoad(gameObject);
 
             Log($"Initializing CheddaBoards v{VERSION} (HTTP API Mode)...");
+            AdoptGameIdFromKey();   // covers an apiKey set in the Inspector
             LoadSavedSession();
             // Resume an interrupted device code link (reload mid-link). Runs
             // synchronously so a login screen that calls LoginWithDeviceCode()
@@ -1081,6 +1134,21 @@ namespace CheddaTech
                     break;
                 }
 
+                case "change_display_name":
+                {
+                    // null in the response means cleared. Pending (player has no
+                    // score yet) still echoes the normalised name, so treat it as set.
+                    string dn = GetString(data, "displayName", "");
+                    _requestedDisplayName = "";
+                    _displayName = dn;
+                    if (_cachedProfile.Count > 0)
+                        _cachedProfile["displayName"] = dn;
+                    bool pending = data != null && data.ContainsKey("pending") && data["pending"] is bool pb && pb;
+                    Log(dn == "" ? "Display name cleared" : $"Display name set to: {dn}{(pending ? " (pending first score)" : "")}");
+                    OnDisplayNameChanged?.Invoke(dn);
+                    break;
+                }
+
                 case "unlock_achievement":
                 {
                     string achId = GetString(data, "achievementId", "");
@@ -1203,6 +1271,14 @@ namespace CheddaTech
 
                 case "game_info":
                 case "game_stats":
+                    if (data != null)
+                    {
+                        InternationalNames = data.ContainsKey("internationalNames") && data["internationalNames"] is bool on && on;
+                        OnGameInfoLoaded?.Invoke(data);
+                    }
+                    Log($"API response: {DictToJson(data)}");
+                    break;
+
                 case "health":
                     Log($"API response: {DictToJson(data)}");
                     break;
@@ -1317,6 +1393,10 @@ namespace CheddaTech
                 case "change_nickname_anonymous":
                     _requestedNickname = "";
                     OnNicknameError?.Invoke(error);
+                    break;
+                case "change_display_name":
+                    _requestedDisplayName = "";
+                    OnDisplayNameError?.Invoke(error);
                     break;
                 case "unlock_achievement":
                     if (_deferredAchievementsRemaining > 0)
@@ -1498,6 +1578,8 @@ namespace CheddaTech
             }
 
             _nickname = nickname;
+            // v2.5.0: only present when the game has International names on.
+            _displayName = GetString(profile, "displayName", "");
             OnProfileLoaded?.Invoke(nickname, score, streak, achievements, playCount);
         }
 
@@ -1625,13 +1707,50 @@ namespace CheddaTech
         {
             apiKey = key;
             Log("API key set");
+            AdoptGameIdFromKey();
         }
 
+        /// <summary>Override the game ID. Optional since 2.4.0: it's read from the
+        /// API key. Pass "" to drop an override and use the key's game again.</summary>
         public void SetGameId(string id)
         {
-            gameId = id;
-            Log($"Game ID set: {id}");
+            gameId = id ?? "";
+            _gameIdFromKey = false;
+            Log($"Game ID set: {gameId}");
+            if (gameId == "")
+                AdoptGameIdFromKey();
             ReconcilePendingLinkWithGameId();
+        }
+
+        /// <summary>The game ID inside an API key. Keys are cb_&lt;game-id&gt;_&lt;random&gt;,
+        /// so it's everything between "cb_" and the last underscore. "" if the key
+        /// isn't in that shape.</summary>
+        private static string GameIdInKey(string key)
+        {
+            if (string.IsNullOrEmpty(key) || !key.StartsWith("cb_")) return "";
+            int end = key.LastIndexOf('_');
+            if (end <= 3) return "";
+            return key.Substring(3, end - 3);
+        }
+
+        /// <summary>Takes the game ID from the API key unless the game set one itself.</summary>
+        private void AdoptGameIdFromKey()
+        {
+            string fromKey = GameIdInKey(apiKey);
+            if (fromKey == "") return;
+            if (string.IsNullOrEmpty(gameId) || gameId == LEGACY_DEFAULT_GAME_ID || _gameIdFromKey)
+            {
+                if (gameId != fromKey)
+                {
+                    gameId = fromKey;
+                    Log($"Game ID taken from API key: {gameId}");
+                }
+                _gameIdFromKey = true;
+            }
+            else if (gameId != fromKey)
+            {
+                Log($"WARNING: game ID '{gameId}' does not match the API key's game '{fromKey}'");
+            }
         }
 
         public void SetSessionToken(string token)
@@ -1666,6 +1785,8 @@ namespace CheddaTech
             _pendingServerNickname = "";
             _pendingRenameAttempts = 0;
             _requestedNickname = "";
+            _displayName = "";
+            _requestedDisplayName = "";
             _playSessionToken = "";
             _lastProfileRefresh = 0f;
         }
@@ -1865,6 +1986,7 @@ namespace CheddaTech
             _sessionToken = "";
             _authType = "";
             _nickname = "";
+            _displayName = "";
             _cachedProfile.Clear();
             ClearSavedSession();
             OnSessionExpired?.Invoke();
@@ -1905,6 +2027,14 @@ namespace CheddaTech
         /// <summary>Anonymous login - uses API key + persistent device ID.</summary>
         public void LoginAnonymous(string nickname = "")
         {
+            // 2.4.0: ignored while a linked session is active (call Logout() first to
+            // switch to a guest). OnLoginSuccess still fires, with the linked nickname.
+            if (!string.IsNullOrEmpty(_sessionToken))
+            {
+                Log("LoginAnonymous() ignored: a linked session is active (call Logout() first)");
+                OnLoginSuccess?.Invoke(_nickname);
+                return;
+            }
             if (string.IsNullOrEmpty(apiKey))
             {
                 OnLoginFailed?.Invoke("API key not set. Call SetApiKey() first.");
@@ -1943,15 +2073,38 @@ namespace CheddaTech
         /// <summary>Alias for LoginInternetIdentity.</summary>
         public void LoginCheddaId(string nickname = "") => LoginInternetIdentity(nickname);
 
-        public void Logout()
+        /// <summary>Signs the player out. Same as Logout(false).</summary>
+        public void Logout() => Logout(false);
+
+        /// <summary>Signs the player out. Pass freshDeviceId = true to also start a
+        /// brand-new anonymous identity, so the next LoginAnonymous() is a new guest
+        /// rather than the device ID that was merged into the account at link time.
+        /// Useful for shared devices and for testing link/merge flows.</summary>
+        public void Logout(bool freshDeviceId)
         {
             ResetPlayerState();
             _authType = "";
             _sessionToken = "";
             ClearSavedSession();
             CancelDeviceCode();
+            if (freshDeviceId)
+                ResetDeviceId();
             OnLogoutSuccess?.Invoke();
             Log("Logged out");
+        }
+
+        /// <summary>Throws away the saved device ID and generates a new one, so the
+        /// next LoginAnonymous() is a brand-new guest.</summary>
+        public void ResetDeviceId()
+        {
+            string oldId = _playerId;
+            _playerId = "";
+            PlayerPrefs.DeleteKey(DEVICE_ID_PREF_KEY);
+            PlayerPrefs.DeleteKey(DEVICE_ID_CREATED_KEY);
+            PlayerPrefs.Save();
+            ResetPlayerState();
+            string newId = GetPlayerId();
+            Log($"Device ID reset: {(oldId.Length > 12 ? oldId.Substring(0, 12) : oldId)} -> {(newId.Length > 12 ? newId.Substring(0, 12) : newId)}");
         }
 
         public bool IsAuthenticated()
@@ -2043,6 +2196,78 @@ namespace CheddaTech
                 OnNicknameError?.Invoke("Not authenticated");
             }
         }
+
+        // ============================================================
+        // PUBLIC API - DISPLAY NAMES (v2.5.0)
+        // ============================================================
+        // A display name is an optional second name in any language. It only
+        // works in games with "International names" turned on in the dashboard,
+        // and only shows on boards there. Your fonts need the characters players
+        // type: add a dynamic TMP font asset made from e.g. Noto Sans CJK to
+        // Project Settings > TextMesh Pro > Settings > Fallback Font Assets.
+        //
+        //   cb.OnDisplayNameChanged += dn => nameLabel.text = dn;
+        //   cb.OnDisplayNameError += why => errorLabel.text = why;
+        //   cb.SetDisplayName("Ana María");
+
+        /// <summary>Set the player's display name. "" clears it (same as
+        /// ClearDisplayName()). The server is the authority on what's allowed
+        /// (2-16 characters, one alphabet with Japanese/Chinese/Korean mixes
+        /// allowed, no emoji) and normalises the text, so use the value from
+        /// OnDisplayNameChanged.</summary>
+        public void SetDisplayName(string displayName)
+        {
+            string dn = (displayName ?? "").Trim();
+            if (dn.Length > 48)
+            {
+                OnDisplayNameError?.Invoke("Display name is too long");
+                return;
+            }
+            var body = new Dictionary<string, object> { { "displayName", dn == "" ? null : dn } };
+            if (!string.IsNullOrEmpty(_sessionToken))
+            {
+                _requestedDisplayName = dn;
+                MakeHttpRequest("/profile/display-name", "PUT", body, "change_display_name");
+                Log("Display name change requested (session)");
+            }
+            else if (!string.IsNullOrEmpty(apiKey))
+            {
+                string pid = GetPlayerId();
+                if (string.IsNullOrEmpty(pid))
+                {
+                    OnDisplayNameError?.Invoke("No player ID set");
+                    return;
+                }
+                _requestedDisplayName = dn;
+                string url = $"/players/{Uri.EscapeDataString(pid)}/display-name";
+                MakeHttpRequest(url, "PUT", body, "change_display_name");
+                Log($"Display name change requested (API) for: {pid}");
+            }
+            else
+            {
+                OnDisplayNameError?.Invoke("Not authenticated");
+            }
+        }
+
+        /// <summary>Remove the player's display name; they show as their nickname again.</summary>
+        public void ClearDisplayName() => SetDisplayName("");
+
+        /// <summary>The player's own display name, "" if none (or the game has
+        /// International names off). Filled by the profile and by OnDisplayNameChanged.</summary>
+        public string GetDisplayName() => _displayName;
+
+        /// <summary>The name to show for a board entry (from OnScoreboardLoaded,
+        /// OnArchivedScoreboardLoaded or OnLeaderboardLoaded): the display name when
+        /// the entry has one, otherwise the nickname. "" means an unnamed guest.</summary>
+        public static string GetEntryName(Dictionary<string, object> entry)
+        {
+            string dn = GetString(entry, "displayName", "");
+            return dn != "" ? dn : GetString(entry, "nickname", "");
+        }
+
+        /// <summary>Overload for entries handed out as plain objects.</summary>
+        public static string GetEntryName(object entry) =>
+            entry is Dictionary<string, object> d ? GetEntryName(d) : "";
 
         // ============================================================
         // PUBLIC API - DEVICE CODE AUTH (Cross-platform social login)
@@ -2896,6 +3121,8 @@ namespace CheddaTech
             Debug.Log("╠══════════════════════════════════════════════╣");
             Debug.Log($"║ Profile                                      ║");
             Debug.Log($"║  - Nickname:         {GetNickname().PadRight(24)}║");
+            Debug.Log($"║  - Display Name:     {GetDisplayName().PadRight(24)}║");
+            Debug.Log($"║  - Intl Names:       {InternationalNames.ToString().PadRight(24)}║");
             Debug.Log($"║  - High Score:       {GetHighScore().ToString().PadRight(24)}║");
             Debug.Log($"║  - Best Streak:      {GetBestStreak().ToString().PadRight(24)}║");
             Debug.Log($"║  - Play Count:       {GetPlayCount().ToString().PadRight(24)}║");

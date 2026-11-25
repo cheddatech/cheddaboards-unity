@@ -11,7 +11,7 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 [![Website](https://img.shields.io/badge/website-cheddaboards.com-blue)](https://cheddaboards.com)
 [![Docs](https://img.shields.io/badge/docs-docs.cheddaboards.com-blue)](https://docs.cheddaboards.com)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.3.1-green)]()
+[![Version](https://img.shields.io/badge/version-2.5.0-green)]()
 [![API uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fapi%2Fuptime.json&label=API%20uptime)](https://status.cheddatech.com)
 [![Leaderboards uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcheddatech%2Fstatus%2FHEAD%2Fapi%2Fleaderboards-on-chain%2Fuptime.json&label=leaderboards%20uptime)](https://status.cheddatech.com)
 
@@ -19,6 +19,7 @@ Drop-in C# SDK for [CheddaBoards](https://cheddaboards.com) — permanent, serve
 
 ## What's new
 
+- **2.5.0** — International display names: players can have a second name in any language (日本語, 한국어, Ελληνικά, accented Latin...) next to their nickname, in games with **International names** turned on in the dashboard. New `SetDisplayName()`, `ClearDisplayName()`, `GetDisplayName()`, `GetEntryName(entry)` and `InternationalNames`. Also from Godot 2.4.0: the game ID is read from the API key (`SetGameId()` is optional), `Logout(true)` starts a fresh guest, and `LoginAnonymous()` no longer demotes a restored linked player to a guest. See [Display names](#display-names-international).
 - **2.3.1** — Shared-device fix: switching player with SetPlayerId() now resets the previous player's state and drops their in-flight responses.
 - **2.3.0** — Device-code sign-in now survives an app restart or WebGL reload: the pending code is saved and polling resumes on the same code, so a player who comes back to a reloaded game is still signed in once they approve. `LoginWithDeviceCode()` reuses a pending code instead of minting a new one (pass `true` to force a fresh one); new `HasPendingDeviceCode()`, `GetDeviceVerificationUrl()` and `GetDeviceCodeSecondsRemaining()` for login screens. Also fixed: `GetGameStats()` (was hitting a route that doesn't exist), direct board reads no longer retry a 404 via the proxy, `GetAuthType()` reports the real provider after linking (Apple sign-ins were labelled google), linked accounts are created with the player's chosen nickname, and `OnAccountUpgradeFailed` actually fires. See [CHANGELOG.md](CHANGELOG.md).
 - **2.2.7** — Three fixes on the anonymous-player paths: submits no longer silently overwrite a player's saved nickname with a generated one; batch achievement sync reports the real synced ids instead of a false "0 synced"; and `GetAchievements()` works again (it now reads from the profile — the standalone route it called never existed). Until a new player's profile loads, `GetNickname()` returns "", so show "Guest"; the server assigns a name (e.g. `Player_1248`) on their first submit.
@@ -56,11 +57,10 @@ Requires **Unity 2022.3 LTS or newer**. Copy `CheddaBoards.cs` into your Unity p
 using CheddaTech;
 
 var cb = CheddaBoards.Instance; // Auto-creates singleton GameObject
-cb.SetApiKey("your-api-key");
-cb.SetGameId("your-game-id");
+cb.SetApiKey("your-api-key"); // the game ID is read from the key
 ```
 
-Get your API key and game ID from the [CheddaBoards Dashboard](https://cheddaboards.com).
+Get your API key from the [CheddaBoards Dashboard](https://cheddaboards.com). Keys look like `cb_<game-id>_<random>`, so the SDK knows your game from the key. Call `cb.SetGameId("your-game-id")` only if you need to override it.
 
 ### 3. Login and submit scores
 
@@ -69,7 +69,6 @@ void Start()
 {
     var cb = CheddaBoards.Instance;
     cb.SetApiKey("your-api-key");
-    cb.SetGameId("your-game-id");
 
     cb.OnLoginSuccess += (nickname) => Debug.Log($"Welcome {nickname}!");
     cb.OnScoreSubmitted += (score, streak) => Debug.Log($"Score saved: {score}");
@@ -176,6 +175,36 @@ cb.OnAccountUpgradeFailed += (error) => Debug.Log($"Migration failed: {error}");
 
 cb.MigrateAnonymousToCurrent(anonymousDeviceId);
 ```
+
+### Logging out and shared devices
+
+```csharp
+cb.Logout();      // sign out; the next LoginAnonymous() is this device's guest again
+cb.Logout(true);  // sign out and start a brand-new guest (new device ID)
+cb.ResetDeviceId(); // just the new device ID part
+```
+
+`LoginAnonymous()` is ignored while a linked session is active (it fires `OnLoginSuccess` with the linked nickname), so calling it at startup never demotes a restored account. Call `Logout()` first to switch to a guest.
+
+---
+
+## Display names (international)
+
+A player can have a display name in any language next to their nickname. The nickname stays the unique ASCII handle (3 to 16 characters); the display name is optional, one per account, not unique, and allows letters from one alphabet (Japanese, Chinese and Korean mixes are fine), digits, `_ - ・` and one space, 2 to 16 characters, no emoji. It only works in games with **International names** turned on in the dashboard.
+
+```csharp
+cb.OnGameInfoLoaded += info => displayNameField.gameObject.SetActive(cb.InternationalNames);
+cb.OnDisplayNameChanged += dn => displayNameField.text = dn;   // "" = cleared
+cb.OnDisplayNameError += why => errorText.text = why;
+cb.GetGameInfo();
+
+cb.SetDisplayName(displayNameField.text);  // "" or ClearDisplayName() removes it
+string mine = cb.GetDisplayName();         // "" if none
+```
+
+Show board rows with `CheddaBoards.GetEntryName(entry)`: the entry's display name when it has one, its nickname otherwise. Showing the nickname smaller beside it helps players tell two "Ana"s apart.
+
+**Fonts:** TextMesh Pro only draws characters in its font assets. Make a dynamic TMP font asset from a font that covers the scripts you expect (e.g. Noto Sans CJK, Noto Sans) and add it under **Project Settings → TextMesh Pro → Settings → Fallback Font Assets**. Guide: [Display names](https://docs.cheddaboards.com/concepts/display-names).
 
 ---
 
@@ -335,6 +364,9 @@ Caps, time validation, and the suspicion log: [Anti-cheat](https://docs.cheddabo
 | `OnAccountUpgradeFailed` | `error` | Anonymous-to-account migration failed (the login itself still succeeded) |
 | `OnProfileLoaded` | `nickname, score, streak, achievements, playCount` | Profile data received |
 | `OnNicknameChanged` | `nickname` | Nickname updated |
+| `OnDisplayNameChanged` | `displayName` | Display name set or cleared (`""`); show this value, the server normalises it |
+| `OnDisplayNameError` | `error` | Display name rejected, or International names is off for this game |
+| `OnGameInfoLoaded` | `info` | `GetGameInfo()` answered; `InternationalNames` is set |
 | `OnArchivesListLoaded` | `scoreboardId, archives` | Archive list received |
 | `OnArchivedScoreboardLoaded` | `archiveId, config, entries` | Archived scoreboard data |
 
@@ -348,6 +380,9 @@ cb.HasAccount()          // true if logged in with a non-anonymous account
 cb.IsAnonymous()         // true if using anonymous auth
 cb.CanConnect()          // true if API key or session is set
 cb.GetNickname()         // current nickname ("" for unnamed anonymous — show "Guest")
+cb.GetDisplayName()      // display name ("" if none or International names is off)
+CheddaBoards.GetEntryName(entry) // display name or nickname for a board row
+cb.InternationalNames    // true if the game has International names on (after GetGameInfo())
 cb.GetHighScore()        // cached high score
 cb.GetBestStreak()       // cached best streak
 cb.GetPlayCount()        // cached play count
@@ -367,7 +402,7 @@ cb.GetDeviceCodeSecondsRemaining()   // real time left (less than 300 after a re
 | Property | Default | Description |
 |----------|---------|-------------|
 | `apiKey` | — | Your CheddaBoards API key |
-| `gameId` | — | Your game ID |
+| `gameId` | from the key | Your game ID. Read from the API key; set it only to override |
 | `debugLogging` | `false` | Enable verbose console logging (set `true` while developing) |
 
 The SDK auto-creates a singleton `GameObject` with `DontDestroyOnLoad`. No manual scene setup required.

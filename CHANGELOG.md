@@ -4,6 +4,23 @@ All notable changes to the CheddaBoards Unity SDK are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0]
+
+International display names, matching the Godot SDK v2.5.0. Also includes the Godot 2.4.0 changes, which never shipped as their own Unity release. Minor bump: adds public API and changes one behaviour (`LoginAnonymous()` during a linked session, see below). Existing games keep working unchanged.
+
+### Added
+- **International display names.** A player can now have a display name in any language (Japanese, Korean, Chinese, Cyrillic, accented Latin and so on) alongside their nickname. The nickname doesn't change: still unique, ASCII, 3 to 16 characters. The display name is optional, one per account and not unique. It only works in games where you turn on **International names** in the dashboard, and only shows on those games' boards. Your fonts need the characters players type: add a TMP fallback font. Guide: [Display names](https://docs.cheddaboards.com/concepts/display-names).
+- **`SetDisplayName(name)` / `ClearDisplayName()`**, with `OnDisplayNameChanged(displayName)` (`""` means cleared) and `OnDisplayNameError(reason)`. The server normalises the name, so show the value from `OnDisplayNameChanged`, not what you sent. A name set before the player's first score is held by the API and applied with that score.
+- **`GetDisplayName()`** returns the player's own display name (`""` if none), read from the profile.
+- **`CheddaBoards.GetEntryName(entry)`** returns the name to show for a board entry: its `displayName` when present, otherwise its `nickname`. Board entries carry `displayName` only in games with International names on.
+- **`OnGameInfoLoaded(info)`** fires when `GetGameInfo()` / `GetGameStats()` answer, and sets the new **`InternationalNames`** property, so a game can show its display-name field only when the setting is on.
+- **`Logout(true)`** also throws away the saved device ID, so the next `LoginAnonymous()` is a brand-new guest instead of the device ID that was merged into the account at link time. Useful on shared devices and for testing link/merge. Plain `Logout()` is unchanged.
+- **`ResetDeviceId()`** does just the device-ID part: deletes the saved ID and generates a new one.
+
+### Changed
+- **The game ID is read from the API key.** Keys look like `cb_<game-id>_<random>`, so `SetApiKey()` alone is now enough. `SetGameId()` is optional and still wins when you call it with a value; if it doesn't match the key, a warning is logged. `SetGameId("")` drops the override and goes back to the key's game. The old Inspector default (`cheddaclick-v2`) counts as unset.
+- **`LoginAnonymous()` while a linked session is active is now ignored.** It's logged, and `OnLoginSuccess` fires with the linked nickname. Before, it switched the SDK to "guest" (`HasAccount()` false) while every request still carried the account's session, so games that call it at startup showed a restored linked player as a guest. To switch to a guest on purpose, call `Logout()` first.
+
 ## [2.3.1]
 
 Shared-device fix, matching the Godot SDK v2.3.1. No API changes.
